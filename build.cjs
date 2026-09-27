@@ -9,8 +9,4 @@ const modules = files.map(file => {
     .replace("require('../config.json')", `(${fs.readFileSync(path.join(root, 'config.json'), 'utf8')})`);
   return `${JSON.stringify(file)}: function(module, exports, load) {\n${source}\n}`;
 });
-const bundle = `'use strict';\nconst modules = {\n${modules.join(',\n')}\n};\nconst cache = Object.create(null);\nfunction load(id) { if (cache[id]) return cache[id].exports; if (!modules[id]) throw new Error('Unknown module'); const m = {exports:{}}; cache[id]=m; modules[id](m,m.exports,load); return m.exports; }\nmodule.exports=load('main.cjs');\n`;
-fs.mkdirSync(path.join(root, 'dist'), { recursive: true });
-fs.writeFileSync(path.join(root, 'dist', 'main.js'), bundle);
-for (const file of ['manifest.json', 'styles.css']) fs.copyFileSync(path.join(root, file), path.join(root, 'dist', file));
-console.log('Built Amygdala Connection:', Buffer.byteLength(bundle), 'bytes');
+const bundle = `'use strict';\nconst modules = {\n${modules.join(',\n')}\n};\nconst cache = Object.create(null);\nfunction load(id) { if (cache[id]) return cache[id].exports; if (!modules[id]) throw new Error('Unknown module'); const m = {exports:{}}; cache[id]=m; modules[id](m,m.exports,load); return m.exports; }\nmodule.exports=load('main.cjs');\n`
