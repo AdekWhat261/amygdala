@@ -2,6 +2,8 @@ name: Release Amygdala
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
 
@@ -9,7 +11,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,6 +19,17 @@ jobs:
         with:
           node-version: 22
       - run: npm test
+      - run: npm run build
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - run: npm run build
       - name: Check tag matches plugin version
         run: node -e 'if (process.env.GITHUB_REF_NAME.replace(/^v/, "") !== require("./manifest.json").version) process.exit(1)'
