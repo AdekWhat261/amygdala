@@ -35,7 +35,11 @@ jobs:
         run: node -e 'if (process.env.GITHUB_REF_NAME.replace(/^v/, "") !== require("./manifest.json").version) process.exit(1)'
       - name: Package mobile fallback
         run: zip -j dist/amygdala-mobile.zip dist/main.js dist/manifest.json dist/styles.css
-      - name: Publish GitHub release
+      - name: Create prerelease if missing
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/main.js dist/manifest.json dist/styles.css dist/amygdala-mobile.zip --generate-notes --verify-tag --prerelease
+        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag --prerelease
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/main.js dist/manifest.json dist/styles.css dist/amygdala-mobile.zip --clobber
