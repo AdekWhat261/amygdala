@@ -7,4 +7,6 @@
 .easy-sync-progress progress { width: 100%; height: 10px; accent-color: var(--interactive-accent); }
 .easy-sync-panel .setting-item { flex-wrap: wrap; gap: 12px; }
 .easy-sync-status { cursor: pointer; max-width: 350px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.amygdala-connection-conf
+.amygdala-connection-conflicts, .easy-sync-conflicts { max-width: 900px; }
+.amygdala-connection-team-plugins .setting-item-description { white-space: pre-line; }
+.easy-sync-diff { max-height: 420px; overflow: auto; padding: 12px; border-radius: 8px; background: var(--background-secondary); white-space: pre-wrap; overflow-wrap: anywhere; }

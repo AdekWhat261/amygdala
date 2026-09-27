@@ -4,4 +4,7 @@
   "private": true,
   "scripts": {
     "build": "node build.cjs",
-    "test": "node --test test/*.
+    "test": "node --test test/*.test.cjs test/*.test.mjs"
+  },
+  "license": "MIT"
+}
