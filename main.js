@@ -1246,4 +1246,385 @@ class ConnectModal extends Modal {
     const teamToken = p.legacyCompatibleSecret(`amygdala-connection-team-${p.device}`, `easy-sync-team-${p.device}`);
     if (!personalToken) new Setting(el).setName('Личное хранилище 0.1').setDesc('Подключается через служебный раздел вашего Google Drive.')
       .addButton(b => b.setButtonText('Войти в личный режим').onClick(() => void this.beginLogin('personal')));
-    if 
+    if (personalToken) {
+      el.createEl('h3', { text: 'Личное хранилище 0.1' });
+      const loading = el.createEl('p', { text: 'Ищу личные хранилища…' });
+      try {
+        const drive = p.drive(null, { mode: 'personal' }), vaults = await drive.listVaults(); loading.remove();
+        for (const vault of vaults) new Setting(el).setName(vault.name)
+          .addButton(b => b.setButtonText('Подключить').onClick(async () => {
+            b.setDisabled(true); try { await p.selectVault({ ...vault, kind: 'personal' }); await this.render(); } catch (e) { p.report(e); b.setDisabled(false); }
+          }));
+        let name = 'Мой цеттелькастен';
+        new Setting(el).setName('Новое личное хранилище').addText(t => t.setValue(name).onChange(v => { name = v; }))
+          .addButton(b => b.setButtonText('Создать').onClick(async () => {
+            b.setDisabled(true); try { const v = await drive.createVault(name); await p.selectVault({ ...v, kind: 'personal' }); await this.render(); }
+            catch (e) { p.report(e); b.setDisabled(false); }
+          }));
+      } catch (e) { loading.setText(e.message); }
+    }
+    if (!teamToken) new Setting(el).setName('Командное хранилище 0.2').setDesc('Вход просит доступ к Google Drive; для закрытой beta авторизация повторяется примерно раз в неделю.')
+      .addButton(b => b.setButtonText('Войти в командный режим').setCta().onClick(() => void this.beginLogin('team')));
+    if (teamToken) {
+      el.createEl('h3', { text: 'Командное хранилище 0.2' });
+    el.createEl('p', { text: 'Владелец делится папкой с вашим Google-аккаунтом. После подтверждения вставьте ссылку на неё сюда.' });
+      let name = 'Командный цеттелькастен';
+      new Setting(el).setName('Создать командную папку').addText(t => t.setValue(name).onChange(v => { name = v; }))
+        .addButton(b => b.setButtonText('Создать').setCta().onClick(async () => {
+          b.setDisabled(true);
+          try { const drive = p.drive(null, { mode: 'team' }); const team = await drive.createTeamVault(name); team.actor = await drive.actorFor(p.accountEmails.team); await p.selectVault(team); await this.render(); }
+          catch (e) { p.report(e); b.setDisabled(false); }
+        }));
+      let shareLink = '';
+      new Setting(el).setName('Подключиться по ссылке').addText(t => t.setPlaceholder('https://drive.google.com/drive/folders/…').onChange(v => { shareLink = v; }))
+        .addButton(b => b.setButtonText('Проверить и подключить').onClick(async () => {
+          b.setDisabled(true);
+          try {
+            const folderId = parseFolderLink(shareLink), drive = p.drive(null, { mode: 'team', folderId });
+            const team = await drive.teamInfo(); team.actor = await drive.actorFor(p.accountEmails.team);
+            await p.selectVault(team); await this.render();
+          } catch (e) { p.report(e); b.setDisabled(false); }
+        }));
+    }
+    el.createEl('p', { text: 'Настройки и включённые плагины устройств не синхронизируются. Командные плагины можно предлагать отдельно; каждый участник сам принимает или отклоняет предложение.' });
+  }
+  async beginLogin(mode) {
+    try { const url = await this.plugin.authFor(mode).start(); window.open(url); }
+    catch (error) { this.plugin.report(error); }
+  }
+  onClose() { this.unsubscribe?.(); this.unsubscribe = null; this.contentEl.empty(); }
+}
+
+class SyncSettings extends PluginSettingTab {
+  constructor(app, plugin) { super(app, plugin); this.plugin = plugin; }
+  display() {
+    const el = this.containerEl, p = this.plugin; el.empty();
+    el.createEl('h2', { text: 'Amygdala' });
+    el.createEl('p', { text: p.label });
+    const account = p.accountEmails[p.connection?.kind === 'team' ? 'team' : 'personal'];
+    new Setting(el).setName('Google Drive').setDesc(account || 'Аккаунт не подключён')
+      .addButton(b => b.setButtonText('Подключение').onClick(() => new ConnectModal(p).open()));
+    new Setting(el).setName('Автоматическая синхронизация').setDesc('Раз в минуту, пока Obsidian открыт.')
+      .addToggle(t => t.setValue(p.prefs.auto).onChange(v => { p.prefs.auto = v; p.app.saveLocalStorage('amygdala-connection-preferences', p.prefs); }));
+    el.createEl('p', { text: 'Синхронизируются заметки, теги, ссылки, рисунки и вложения. Настройки и включённые плагины устройств не синхронизируются.' });
+    el.createEl('p', { text: 'Перед использованием отключите другие плагины синхронизации для этого хранилища. История заменённых файлов хранится локально в .easy-sync/recovery.' });
+  }
+}
+
+function lineDiff(before, after) {
+  const left = before.split('\n'), right = after.split('\n');
+  if (left.length * right.length > 200000) return 'Файл слишком велик для встроенного сравнения. Откройте обе версии и сравните их в редакторе.';
+  const width = right.length + 1, table = new Uint32Array((left.length + 1) * width);
+  for (let i = left.length - 1; i >= 0; i--) for (let j = right.length - 1; j >= 0; j--) {
+    table[i * width + j] = left[i] === right[j] ? table[(i + 1) * width + j + 1] + 1
+      : Math.max(table[(i + 1) * width + j], table[i * width + j + 1]);
+  }
+  const lines = []; let i = 0, j = 0;
+  while (i < left.length && j < right.length) {
+    if (left[i] === right[j]) { lines.push(`  ${left[i++]}`); j++; }
+    else if (table[(i + 1) * width + j] >= table[i * width + j + 1]) lines.push(`− ${left[i++]}`);
+    else lines.push(`+ ${right[j++]}`);
+  }
+  while (i < left.length) lines.push(`− ${left[i++]}`);
+  while (j < right.length) lines.push(`+ ${right[j++]}`);
+  return lines.join('\n');
+}
+
+class ConflictModal extends Modal {
+  constructor(plugin, conflicts) { super(plugin.app); this.plugin = plugin; this.conflicts = conflicts; }
+  onOpen() { void this.render(); }
+  async render() {
+    const el = this.contentEl, p = this.plugin;
+    el.empty(); el.addClass('amygdala-connection-conflicts');
+    el.createEl('h2', { text: 'Конфликты Amygdala' });
+    if (!this.conflicts.length) { el.createEl('p', { text: 'Активных конфликтов нет.' }); return; }
+    for (const conflict of this.conflicts) {
+      el.createEl('h3', { text: conflict.path });
+      const live = conflict.variants.filter(variant => !variant.deleted);
+      if (live.length > 1) {
+        const firstText = new TextDecoder('utf-8', { fatal: false }).decode(await p.engine.local.readConflict(conflict.path, live[0].hash));
+        for (const variant of live.slice(1)) {
+          const otherText = new TextDecoder('utf-8', { fatal: false }).decode(await p.engine.local.readConflict(conflict.path, variant.hash));
+          el.createEl('h4', { text: `Сравнение: ${live[0].actorName} / ${variant.actorName}` });
+          el.createEl('pre', { text: lineDiff(firstText, otherText), cls: 'easy-sync-diff' });
+        }
+      }
+      for (const variant of conflict.variants) {
+        const info = [variant.actorName, variant.deviceId ? `устройство ${variant.deviceId.slice(0, 8)}` : '', variant.createdAt ? new Date(variant.createdAt).toLocaleString() : '', variant.deleted ? 'удаление' : ''].filter(Boolean).join(' · ');
+        el.createEl('p', { text: `${info || 'Неизвестный участник'} · ${variant.deleted ? 'версия удаляет заметку' : variant.hash.slice(0, 12)}` });
+        if (!variant.deleted) new Setting(el).setName('Версия').addButton(b => b.setButtonText('Открыть копию').onClick(() => void p.app.workspace.openLinkText(variant.copyPath, '', true)))
+          .addButton(b => b.setButtonText('Оставить эту').setCta().onClick(async () => {
+            b.setDisabled(true);
+            try { await p.engine.resolveConflict(conflict.path, variant.id); await p.sync(true); this.conflicts = await p.engine.listConflicts(); await this.render(); }
+            catch (error) { p.report(error); b.setDisabled(false); }
+          }));
+        else new Setting(el).setName('Версия удаления').addButton(b => b.setButtonText('Принять удаление').onClick(async () => {
+          b.setDisabled(true);
+          try { await p.engine.resolveConflict(conflict.path, variant.id); await p.sync(true); this.conflicts = await p.engine.listConflicts(); await this.render(); }
+          catch (error) { p.report(error); b.setDisabled(false); }
+        }));
+      }
+      new Setting(el).setName('Объединить вручную').setDesc('Откройте оригинал и варианты, отредактируйте оригинал, затем сохраните его как объединённую версию.')
+        .addButton(b => b.setButtonText('Открыть оригинал').onClick(() => void p.app.workspace.openLinkText(conflict.path, '', true)))
+        .addButton(b => b.setButtonText('Сохранить объединение').onClick(async () => {
+          b.setDisabled(true);
+          try {
+            const data = await p.engine.local.read(conflict.path);
+            if (data === null) throw new Error('Оригинальная заметка удалена. Восстановите её или выберите версию удаления.');
+            await p.engine.resolveConflict(conflict.path, 'manual', data); await p.sync(true);
+            this.conflicts = await p.engine.listConflicts(); await this.render();
+          } catch (error) { p.report(error); b.setDisabled(false); }
+        }));
+    }
+  }
+}
+
+class TeamPluginsModal extends Modal {
+  constructor(plugin) { super(plugin.app); this.plugin = plugin; }
+  onOpen() { void this.render(); }
+  async render() {
+    const p = this.plugin, el = this.contentEl;
+    el.empty(); el.addClass('amygdala-connection-team-plugins');
+    el.createEl('h2', { text: 'Командные плагины' });
+    if (p.connection?.kind !== 'team') { el.createEl('p', { text: 'Подключите командное хранилище.' }); return; }
+    if (!p.app.vault.adapter.read || !p.app.vault.adapter.write || !p.app.vault.adapter.list) {
+      el.createEl('p', { text: 'Чтение установленных плагинов недоступно в этой версии Obsidian.' }); return;
+    }
+    const status = el.createEl('p', { text: 'Загружаю список…' });
+    const drive = p.drive();
+    let catalog;
+    try { catalog = validateCatalog(await drive.getTeamPluginCatalog()); }
+    catch (error) { status.setText(error.message); return; }
+    status.setText('Установленные плагины с этого устройства можно предложить команде. На других устройствах они только скачиваются после согласия и не включаются автоматически.');
+    let pluginFolders = [];
+    try {
+      if (await p.app.vault.adapter.exists('.obsidian/plugins')) pluginFolders = (await p.app.vault.adapter.list('.obsidian/plugins')).folders || [];
+    } catch { status.setText('Список предложений команды доступен, но перечень локальных плагинов прочитать не удалось.'); }
+    const manifests = new Map();
+    for (const folder of pluginFolders) {
+      const folderPath = folder.startsWith('.obsidian/plugins/') ? folder : `.obsidian/plugins/${folder}`;
+      const id = folderPath.split('/').at(-1);
+      try {
+        const manifest = JSON.parse(await p.app.vault.adapter.read(`${folderPath}/manifest.json`));
+        if (manifest.id === id && typeof manifest.name === 'string' && typeof manifest.version === 'string'
+          && typeof manifest.author === 'string' && typeof manifest.description === 'string') manifests.set(id, {
+          id, name: manifest.name.slice(0, 120), version: manifest.version, author: manifest.author.slice(0, 120), description: manifest.description.slice(0, 500)
+        });
+      } catch { /* Ignore incomplete or invalid plugin folders. */ }
+    }
+    const proposed = new Set(catalog.map(item => item.id));
+    for (const item of manifests.values()) {
+      const setting = new Setting(el).setName(item.name).setDesc(`${item.id} · версия ${item.version} · ${item.author || 'автор не указан'}`);
+      if (proposed.has(item.id)) {
+        const current = catalog.find(value => value.id === item.id);
+        if (current.proposedById === p.connection.actor?.actorId) setting.addButton(button => button.setButtonText('Убрать предложение').onClick(async () => {
+          button.setDisabled(true);
+          try { await this.publishCatalog(catalog.filter(value => value.id !== item.id)); await this.render(); }
+          catch (error) { p.report(error); button.setDisabled(false); }
+        }));
+        if (current.version !== item.version) setting.addButton(button => button.setButtonText(`Предложить версию ${item.version}`).onClick(async () => {
+          button.setDisabled(true);
+          try { await this.publishCatalog(catalog.map(value => value.id === item.id ? item : value)); await this.render(); }
+          catch (error) { p.report(error); button.setDisabled(false); }
+        }));
+      }
+      else setting.addButton(button => button.setButtonText('Предложить команде').onClick(async () => {
+        button.setDisabled(true);
+        try { await this.publishCatalog([...catalog, item]); await this.render(); }
+        catch (error) { p.report(error); button.setDisabled(false); }
+      }));
+    }
+    if (!manifests.size) el.createEl('p', { text: 'На устройстве не найдено установленных community plugins.' });
+    el.createEl('h3', { text: 'Предложения команды' });
+    const acceptedValue = p.app.loadLocalStorage(`amygdala-connection-team-plugin-accepted-${p.connection.id}`);
+    const declinedValue = p.app.loadLocalStorage(`amygdala-connection-team-plugin-declined-${p.connection.id}`);
+    const accepted = new Set(Array.isArray(acceptedValue) ? acceptedValue : []);
+    const declined = new Set(Array.isArray(declinedValue) ? declinedValue : []);
+    for (const item of catalog) {
+      const choiceKey = `${item.id}@${item.version}`;
+      const installedPath = `.obsidian/plugins/${item.id}/manifest.json`;
+      let installed = null;
+      try { if (await p.app.vault.adapter.exists(installedPath)) installed = JSON.parse(await p.app.vault.adapter.read(installedPath)); } catch { /* Display invalid installs for manual recovery. */ }
+      const isInstalled = Boolean(installed?.id === item.id);
+      const needsUpdate = isInstalled && installed.version !== item.version;
+      const state = isInstalled ? `Установлена версия ${installed.version}${needsUpdate ? '; предложена новая версия' : ''}.` : accepted.has(choiceKey) ? 'Вы приняли предложение; загрузку можно повторить.' : declined.has(choiceKey) ? 'Предложение отклонено на этом устройстве.' : 'Предлагается установить.';
+      const setting = new Setting(el).setName(item.name).setDesc(`${item.description}\n${item.id} · версия ${item.version} · ${item.author} · предложил: ${item.proposedByName || 'участник'} · ${state}`);
+      if (isInstalled && needsUpdate) {
+        if (accepted.has(choiceKey)) setting.addButton(button => button.setButtonText('Обновить на эту версию').onClick(() => void this.install(item, button)));
+        else if (declined.has(choiceKey)) setting.addButton(button => button.setButtonText('Принять обновление').onClick(() => {
+          declined.delete(choiceKey); accepted.add(choiceKey); this.saveChoices(accepted, declined); void this.install(item, button);
+        }));
+        else setting.addButton(button => button.setButtonText('Обновить на эту версию').onClick(() => {
+          accepted.add(choiceKey); declined.delete(choiceKey); this.saveChoices(accepted, declined); void this.install(item, button);
+        })).addButton(button => button.setButtonText('Отказаться от обновления').onClick(() => {
+          declined.add(choiceKey); accepted.delete(choiceKey); this.saveChoices(accepted, declined); void this.render();
+        }));
+        continue;
+      }
+      if (isInstalled) continue;
+      if (accepted.has(choiceKey)) setting.addButton(button => button.setButtonText('Скачать ещё раз').onClick(() => void this.install(item, button)));
+      else if (declined.has(choiceKey)) setting.addButton(button => button.setButtonText('Принять предложение').onClick(() => {
+        declined.delete(choiceKey); accepted.add(choiceKey); this.saveChoices(accepted, declined); void this.install(item, button);
+      }));
+      else setting.addButton(button => button.setButtonText('Установить').setCta().onClick(() => {
+        accepted.add(choiceKey); declined.delete(choiceKey); this.saveChoices(accepted, declined); void this.install(item, button);
+      })).addButton(button => button.setButtonText('Отказаться').onClick(() => {
+        declined.add(choiceKey); accepted.delete(choiceKey); this.saveChoices(accepted, declined); void this.render();
+      }));
+    }
+    if (!catalog.length) el.createEl('p', { text: 'Пока никто не предложил командные плагины.' });
+  }
+  saveChoices(accepted, declined) {
+    const key = `amygdala-connection-team-plugin-accepted-${this.plugin.connection.id}`;
+    const declinedKey = `amygdala-connection-team-plugin-declined-${this.plugin.connection.id}`;
+    this.plugin.app.saveLocalStorage(key, [...accepted]);
+    this.plugin.app.saveLocalStorage(declinedKey, [...declined]);
+  }
+  async publishCatalog(plugins) {
+    const p = this.plugin, clean = validateCatalog({ schema: 1, plugins });
+    const before = validateCatalog(await p.drive().getTeamPluginCatalog());
+    const oldById = new Map(before.map(item => [item.id, item]));
+    const nextById = new Map(clean.map(item => [item.id, item]));
+    for (const [id, item] of nextById) {
+      const old = oldById.get(id);
+      if (!old || old.version !== item.version || old.name !== item.name || old.author !== item.author || old.description !== item.description) {
+        await p.drive().putTeamPluginChange('propose', item, p.connection.actor, p.device);
+      }
+    }
+    for (const [id, item] of oldById) if (!nextById.has(id)) await p.drive().putTeamPluginChange('withdraw', item, p.connection.actor, p.device);
+  }
+  async install(item, button) {
+    button.setDisabled(true);
+    try {
+      await this.plugin.installTeamPlugin(item);
+      new Notice(`${item.name} скачан. Проверьте код перед включением в настройках Obsidian.`);
+      await this.render();
+    } catch (error) { this.plugin.report(error); button.setDisabled(false); }
+  }
+}
+
+module.exports = EasySync;
+
+},
+"planner.cjs": function(module, exports, load) {
+'use strict';
+
+const EXCLUDED = new Set(['.obsidian', '.trash', '.git', '.easy-sync']);
+const RESERVED = /^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i;
+// Conservative Unicode folding also catches sharp-s and final-sigma aliases.
+const portableKey = path => path.normalize('NFC').toUpperCase().toLowerCase().normalize('NFC');
+
+function validatePath(path) {
+  if (typeof path !== 'string' || !path || path.startsWith('/') || path.includes('\\')) {
+    throw new Error(`Invalid portable path: ${JSON.stringify(path)}`);
+  }
+  const parts = path.split('/');
+  for (const part of parts) {
+    if (!part || part === '.' || part === '..' || /[<>:"|?*\u0000-\u001f\u007f]/u.test(part) || /[. ]$/u.test(part) || RESERVED.test(part)) {
+      throw new Error(`Invalid portable path: ${JSON.stringify(path)}`);
+    }
+  }
+  return path;
+}
+
+function isExcluded(path) {
+  return path.split('/').some(part => EXCLUDED.has(part.toLowerCase()));
+}
+
+function entries(value, name) {
+  if (value === undefined || value === null) return [];
+  if (typeof value !== 'object' || Array.isArray(value) || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+    throw new TypeError(`${name} must be a plain path-to-hash object`);
+  }
+  return Object.entries(value).map(([path, hash]) => {
+    validatePath(path);
+    if (typeof hash !== 'string' || hash.length === 0) throw new TypeError(`Invalid hash for ${path}`);
+    return [path, hash];
+  }).filter(([path]) => !isExcluded(path));
+}
+
+function planSync({ local, remote, baseline } = {}) {
+  const maps = [new Map(entries(local, 'local')), new Map(entries(remote, 'remote')), new Map(entries(baseline, 'baseline'))];
+  const [l, r, b] = maps;
+  const paths = [...new Set(maps.flatMap(map => [...map.keys()]))].sort();
+  const canonical = new Map();
+  for (const path of paths) {
+    const key = portableKey(path);
+    if (canonical.has(key) && canonical.get(key) !== path) throw new Error(`Path collision: ${canonical.get(key)} and ${path}`);
+    canonical.set(key, path);
+  }
+  // A file cannot coexist with a directory of the same portable name.
+  for (const path of paths) {
+    const parts = path.split('/');
+    for (let i = 1; i < parts.length; i++) {
+      const prefix = portableKey(parts.slice(0, i).join('/'));
+      if (canonical.has(prefix)) throw new Error(`File/directory collision: ${canonical.get(prefix)} and ${path}`);
+    }
+  }
+  const operations = [];
+  const unchanged = [];
+  for (const path of paths) {
+    const localHash = l.get(path) ?? null;
+    const remoteHash = r.get(path) ?? null;
+    const baselineHash = b.get(path) ?? null;
+    if (localHash === remoteHash) { unchanged.push(path); continue; }
+    let kind;
+    let reason;
+    if (baselineHash === null) {
+      if (localHash === null) kind = 'download';
+      else if (remoteHash === null) kind = 'upload';
+      else { kind = 'conflict'; reason = 'first-merge'; }
+    } else if (localHash === baselineHash) {
+      kind = remoteHash === null ? 'delete-local' : 'download';
+    } else if (remoteHash === baselineHash) {
+      kind = localHash === null ? 'delete-remote' : 'upload';
+    } else {
+      kind = 'conflict';
+      reason = localHash === null || remoteHash === null ? 'edit-delete' : 'both-modified';
+    }
+    operations.push({ path, kind, localHash, remoteHash, baselineHash, ...(reason ? { reason } : {}) });
+  }
+  return { operations, unchanged };
+}
+
+module.exports = { planSync, validatePath, isExcluded };
+
+},
+"team-plugins.cjs": function(module, exports, load) {
+'use strict';
+
+const ID = /^[a-z0-9][a-z0-9._-]{0,99}$/;
+const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+const MAX = 200;
+
+function validateCatalog(value) {
+  if (!value || typeof value !== 'object' || value.schema !== 1 || !Array.isArray(value.plugins) || value.plugins.length > MAX) {
+    throw new Error('Некорректный каталог командных плагинов.');
+  }
+  const seen = new Set();
+  return value.plugins.map(plugin => {
+    if (!plugin || typeof plugin !== 'object' || typeof plugin.id !== 'string' || !ID.test(plugin.id)
+      || typeof plugin.version !== 'string' || !VERSION.test(plugin.version)
+      || typeof plugin.name !== 'string' || !plugin.name.trim() || plugin.name.length > 120
+      || typeof plugin.author !== 'string' || plugin.author.length > 120
+      || typeof plugin.description !== 'string' || plugin.description.length > 500) {
+      throw new Error('В каталоге есть плагин с некорректными данными.');
+    }
+    if (plugin.id === 'amygdala-connection' || seen.has(plugin.id)) throw new Error('Каталог содержит повторяющийся или служебный плагин.');
+    seen.add(plugin.id);
+    const clean = { id: plugin.id, version: plugin.version, name: plugin.name.trim(), author: plugin.author.trim(), description: plugin.description.trim() };
+    if (plugin.proposedById !== undefined && (typeof plugin.proposedById !== 'string' || plugin.proposedById.length > 256)) throw new Error('Некорректный автор предложения плагина.');
+    if (plugin.proposedByName !== undefined && (typeof plugin.proposedByName !== 'string' || plugin.proposedByName.length > 120)) throw new Error('Некорректное имя автора предложения.');
+    if (plugin.proposedById) clean.proposedById = plugin.proposedById;
+    if (plugin.proposedByName) clean.proposedByName = plugin.proposedByName;
+    return clean;
+  }).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+module.exports = { validateCatalog };
+
+}
+};
+const cache = Object.create(null);
+function load(id) { if (cache[id]) return cache[id].exports; if (!modules[id]) throw new Error('Unknown module'); const m = {exports:{}}; cache[id]=m; modules[id](m,m.exports,load); return m.exports; }
+module.exports=load('main.cjs');
