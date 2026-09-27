@@ -44,9 +44,9 @@ node --test test/*.test.cjs test/*.test.mjs
 node build.cjs
 ```
 
-Тесты проверяют DAG, обратную совместимость личного режима, bridge, таблицу, журнал и блобы. До выпуска остаются реальные проверки Picker и доступа двумя Google-аккаунтами на Windows и телефоне. Не считайте зелёные unit-тесты подтверждением работы Google OAuth.
+Тесты проверяют DAG, обратную совместимость личного режима, bridge, таблицу, журнал и блобы. Beta-релиз доступен, но реальные проверки Picker и доступа двумя Google-аккаунтами на Windows и телефоне ещё не завершены. Не считайте зелёные unit-тесты подтверждением работы Google OAuth.
 
-После проверки выпускаются GitHub Release файлы `main.js`, `manifest.json`, `styles.css`; репозиторий можно установить через BRAT. Подробности входа и развертывания см. в [`bridge/README.md`](bridge/README.md).
+В [GitHub Release v0.3.0](https://github.com/AdekWhat261/amygdala/releases/tag/v0.3.0) опубликованы `main.js`, `manifest.json`, `styles.css` и мобильный ZIP. Beta устанавливается через BRAT; в официальный каталог Community Plugins она пока не включена. Подробности входа и развертывания см. в [`bridge/README.md`](bridge/README.md).
 
 ### Установка beta через BRAT
 
