@@ -1,0 +1,7 @@
+{
+  "name": "amygdala-connection",
+  "version": "0.2.0",
+  "private": true,
+  "scripts": {
+    "build": "node build.cjs",
+    "test": "node --test test/*.
