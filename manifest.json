@@ -1,9 +1,9 @@
 {
   "id": "amygdala-connection",
   "name": "Amygdala",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "minAppVersion": "1.11.4",
-  "description": "Sync personal notes or share a team vault and plugin recommendations through a selected Google Drive file.",
+  "description": "Experimental personal and scoped team note sync through Google Drive. Existing team histories require explicit migration.",
   "author": "Amygdala contributors",
   "isDesktopOnly": false
 }

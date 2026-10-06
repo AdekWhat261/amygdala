@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHandler } from '../bridge/worker.mjs';
+import { createHandler } from '../test-fixtures/public-v0.3.0-bridge/worker.mjs';
 const state = 's'.repeat(43), verifier = 'v'.repeat(43);
 const config = { clientId: 'client', clientSecret: 'SECRET', redirectUri: 'https://bridge.example/oauth/callback' };
 const post = (path, data, headers = {}) => new Request(`https://bridge.example${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: JSON.stringify(data) });

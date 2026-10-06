@@ -1,45 +1,52 @@
-name: Release Amygdala
+name: Prepare release
 
 on:
   push:
-    branches:
-      - main
-    tags:
-      - 'v*'
+    tags: ['[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  verify:
+  validate:
+    uses: ./.github/workflows/ci.yml
+  draft:
+    needs: validate
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          node-version: 22
-      - run: npm run build
-      - run: npm test
-
-  release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: verify
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
-          node-version: 22
-      - run: npm run build
-      - name: Check tag matches plugin version
-        run: node -e 'if (process.env.GITHUB_REF_NAME.replace(/^v/, "") !== require("./manifest.json").version) process.exit(1)'
-      - name: Package mobile fallback
-        run: zip -j dist/amygdala-mobile.zip dist/main.js dist/manifest.json dist/styles.css
-      - name: Create prerelease if missing
+          node-version-file: .node-version
+          package-manager-cache: false
+      - name: Validate exact stable tag and runtime
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node -e 'const m=require("./manifest.json"),p=require("./package.json");if(!/^\d+\.\d+\.\d+$/.test(process.env.RELEASE_TAG)||m.version!==process.env.RELEASE_TAG||p.version!==m.version||p.engines.node!==process.versions.node)throw Error("Tag, manifest, package or Node mismatch")'
+      - name: Build and run deterministic tests
+        run: node run-tests.cjs
+      - name: Prepare exact assets with source hashes
+        env:
+          RELEASE_OUTPUT: ${{ runner.temp }}/amygdala-release
+          RELEASE_REPORT: ${{ runner.temp }}/amygdala-build-evidence.json
+        run: |
+          node scripts/release-package.cjs --build --output "$RELEASE_OUTPUT" > "$RELEASE_REPORT"
+          cat "$RELEASE_REPORT"
+          cd "$RELEASE_OUTPUT"
+          sha256sum --check SHA256SUMS.txt
+      - name: Create draft without overwriting existing release assets
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag --prerelease
-      - name: Upload release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" dist/main.js dist/manifest.json dist/styles.css dist/amygdala-mobile.zip --clobber
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_OUTPUT: ${{ runner.temp }}/amygdala-release
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          gh release create "$RELEASE_TAG" --repo "$RELEASE_REPOSITORY" --verify-tag --draft --title "Amygdala $RELEASE_TAG" --notes 'Draft package. Publish after recorded Windows and Android acceptance. See docs/DEVICE_ACCEPTANCE.md.' "$RELEASE_OUTPUT/main.js" "$RELEASE_OUTPUT/manifest.json" "$RELEASE_OUTPUT/styles.css" "$RELEASE_OUTPUT/SHA256SUMS.txt"

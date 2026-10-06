@@ -14,8 +14,35 @@ class SyncEngine {
     this.running = this.run().finally(() => { this.running = null; });
     return this.running;
   }
+  async assertScopeProtocol() {
+    const scoped = this.local.scopePath !== null && this.local.scopePath !== undefined;
+    if (!scoped) {
+      if (typeof this.remote.assertScopeProtocol === 'function') throw new Error('A scoped team project requires a nonempty local folder');
+      return;
+    }
+    if (!this.local.scopePath || typeof this.remote.assertScopeProtocol !== 'function') {
+      throw new Error('Team sync paused: the remote scope protocol is not verified. Legacy projects require an explicit migration plan.');
+    }
+    const protocol = await this.remote.assertScopeProtocol();
+    if (protocol?.pathProtocol !== 'project-relative-v1' || typeof protocol.namespace !== 'string'
+      || !/^[A-Za-z0-9_-]{8,128}$/.test(protocol.namespace)) throw new Error('Invalid remote scope protocol');
+    const binding = { pathProtocol: protocol.pathProtocol, namespace: protocol.namespace, localScope: this.local.scopePath };
+    if (this.state.scopeBinding) {
+      const current = this.state.scopeBinding;
+      if (current.pathProtocol !== binding.pathProtocol || current.namespace !== binding.namespace || current.localScope !== binding.localScope) {
+        throw new Error('Local journal belongs to another scope or project; no pending records were sent');
+      }
+    } else {
+      if (this.state.outbox.length || Object.keys(this.state.baseline).length) throw new Error('Unbound legacy local journal requires explicit migration; no pending records were sent');
+      this.state.scopeBinding = binding;
+      try { await this.persist(); }
+      catch (error) { delete this.state.scopeBinding; throw error; }
+    }
+  }
   async persist() { await this.saveState(this.state); }
   async flush(progress = {}) {
+    if (!this.state.outbox.length) return;
+    await this.assertScopeProtocol();
     const total = progress.total ?? this.state.outbox.length;
     let completed = progress.completed ?? 0;
     if (this.state.outbox.length) this.progress({ phase: 'upload', completed, total });
@@ -49,7 +76,19 @@ class SyncEngine {
     if (!(bytes instanceof Uint8Array) || await this.hash(bytes) !== hash) throw new Error(`Blob integrity failure: ${hash}`);
     return bytes;
   }
+  assertHistory(events) {
+    const knownIds = new Set([...events, ...this.state.outbox.map(item => item.event)].map(event => event.id));
+    for (const base of Object.values(this.state.baseline)) {
+      if (!Array.isArray(base.heads) || base.heads.some(id => !knownIds.has(id)))
+        throw new Error('Remote history missing previously synchronized revisions');
+    }
+  }
   async verify() {
+    await this.assertScopeProtocol();
+    if (!this.local.scopePath) {
+      if (this.remote.beginPass) await this.remote.beginPass();
+      else await this.remote.assertAccess?.();
+    }
     this.progress({ phase: 'listing' });
     const events = await this.remote.listEvents();
     const merged = materialize(events);
@@ -86,23 +125,37 @@ class SyncEngine {
     return { files: expected.size, conflicts: [...merged.values()].filter(heads => resolveHeads(heads).hasConflict).length, blobs: hashes.size };
   }
   async run() {
+    await this.assertScopeProtocol();
     // A failed/incomplete listing cannot authorize local edits or deletion.
-    await this.remote.assertAccess?.();
+    if (!this.local.scopePath) {
+      if (this.remote.beginPass) await this.remote.beginPass();
+      else await this.remote.assertAccess?.();
+    }
     this.progress({ phase: 'listing' });
     let events = await this.remote.listEvents();
     materialize([...events,...this.state.outbox.map(item=>item.event)]);
-    const knownIds = new Set([...events,...this.state.outbox.map(item=>item.event)].map(event=>event.id));
-    for (const base of Object.values(this.state.baseline)) {
-      if (!Array.isArray(base.heads) || base.heads.some(id=>!knownIds.has(id))) throw new Error('Remote history missing previously synchronized revisions');
-    }
+    this.assertHistory(events);
     await this.flush();
     events = await this.remote.listEvents();
+    this.assertHistory(events);
     const remoteHeads = materialize(events);
     const snapshot = await this.local.scan();
     this.progress({ phase: 'planning', total: Object.keys(snapshot).length });
     const remotePaths = Object.fromEntries([...remoteHeads].filter(([,heads]) => heads.some(h => h.hash !== null)).map(([path]) => [path,'remote']));
     planSync({local:snapshot, remote:remotePaths});
     const drafts = planLocalRevisions({local:snapshot, baseline:this.state.baseline, remoteHeads});
+    if (this.remote.preflightInitialUpload && events.length === 0 && this.state.outbox.length === 0 && Object.keys(this.state.baseline).length === 0) {
+      const sizes = [], eventByteSizes = [], seen = new Set();
+      for (const draft of drafts) {
+        if (draft.hash === null) { eventByteSizes.push(0); continue; }
+        const data = await this.local.read(draft.path);
+        if (!data || await this.hash(data) !== draft.hash) throw new Error('Файл изменился во время проверки ёмкости v4.');
+        eventByteSizes.push(data.byteLength);
+        if (!seen.has(draft.hash)) { sizes.push(data.byteLength); seen.add(draft.hash); }
+      }
+      const candidates = drafts.map((draft, index) => validateRevision({ id: `preflight_${index}`, ...draft, ...this.revisionMetadata() }));
+      await this.remote.preflightInitialUpload({ blobSizes: sizes, events: candidates, eventByteSizes });
+    }
     const deferred = [];
     let uploaded = 0, queuedCount = 0, queuedBytes = 0;
     this.progress({ phase: 'upload', completed: uploaded, total: drafts.length });
@@ -128,7 +181,16 @@ class SyncEngine {
     if (queuedCount) { await this.flush({ completed: uploaded, total: drafts.length }); uploaded += queuedCount; }
     this.progress({ phase: 'reconciling' });
     events = await this.remote.listEvents();
+    this.assertHistory(events);
     const merged = materialize(events);
+    await this.remote.validateSnapshot?.(events);
+    // A new authorization read is required before any local write/delete or
+    // conflict copy. A genuinely unchanged snapshot makes no such mutation.
+    const needsLocalMutation = [...merged].some(([path, heads]) => {
+      const resolution = resolveHeads(heads);
+      return resolution.hasConflict || (resolution.canonical?.hash ?? null) !== (snapshot[path] ?? null);
+    });
+    if (needsLocalMutation) await this.remote.assertAccess?.();
     const destinations = Object.fromEntries(Object.keys(snapshot).map(path=>[path,'local']));
     for (const [path,heads] of merged) {
       const resolution = resolveHeads(heads);
@@ -185,6 +247,7 @@ class SyncEngine {
     return { actorId: this.actor.actorId, actorName: this.actor.actorName, ...(this.deviceId ? { deviceId: this.deviceId } : {}), createdAt: new Date().toISOString() };
   }
   async listConflicts() {
+    await this.assertScopeProtocol();
     await this.remote.assertAccess?.();
     const events = await this.remote.listEvents();
     const merged = materialize(events), result = [];
@@ -204,6 +267,7 @@ class SyncEngine {
     return result;
   }
   async resolveConflict(path, variantId, manualBytes = null) {
+    await this.assertScopeProtocol();
     await this.remote.assertAccess?.();
     const events = await this.remote.listEvents();
     const headsByPath = materialize(events), heads = headsByPath.get(path);

@@ -1,3 +1,4 @@
+/* Based on public v0.3.0 styles; truncated trailing selector removed. Not authenticated beta7 CSS. */
 .amygdala-connection-panel, .easy-sync-panel { max-width: 560px; padding: 8px; }
 .amygdala-connection-panel h2, .easy-sync-panel h2 { line-height: 1.25; }
 .amygdala-connection-panel p, .easy-sync-panel p { color: var(--text-muted); line-height: 1.6; }
@@ -7,4 +8,4 @@
 .easy-sync-progress progress { width: 100%; height: 10px; accent-color: var(--interactive-accent); }
 .easy-sync-panel .setting-item { flex-wrap: wrap; gap: 12px; }
 .easy-sync-status { cursor: pointer; max-width: 350px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.amygdala-connection-conf
+
