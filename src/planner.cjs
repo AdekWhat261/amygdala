@@ -18,6 +18,21 @@ function validatePath(path) {
   return path;
 }
 
+function normalizeFolderPath(path) {
+  if (typeof path !== 'string') throw new TypeError('Folder path must be a string');
+  const normalized = path.normalize('NFC').replace(/\/+$/u, '');
+  if (!normalized) throw new Error('Choose a specific folder inside the vault');
+  validatePath(normalized);
+  if (isExcluded(normalized)) throw new Error('This folder is reserved for Obsidian or Amygdala');
+  return normalized;
+}
+
+function isWithinFolder(path, folderPath) {
+  validatePath(path);
+  const folder = normalizeFolderPath(folderPath);
+  return path.startsWith(`${folder}/`);
+}
+
 function isExcluded(path) {
   return path.split('/').some(part => EXCLUDED.has(part.toLowerCase()));
 }
@@ -78,4 +93,4 @@ function planSync({ local, remote, baseline } = {}) {
   return { operations, unchanged };
 }
 
-module.exports = { planSync, validatePath, isExcluded };
+module.exports = { planSync, validatePath, isExcluded, normalizeFolderPath, isWithinFolder };

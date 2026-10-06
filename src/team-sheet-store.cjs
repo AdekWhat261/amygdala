@@ -78,7 +78,7 @@ class TeamSheetStore {
     const spreadsheetId = safeId(created?.spreadsheetId);
     this.folderId = folderId; this.spreadsheetId = spreadsheetId;
     await this.sheetCall('/values:batchUpdate', { method: 'POST', body: JSON.stringify({ valueInputOption: 'RAW', data: [
-      { range: 'Meta!A1:B2', values: [['key', 'value'], ['manifest', JSON.stringify({ schema: 1, type: 'amygdala-team-sheet', version: 3, id: spreadsheetId, folderId, name: cleanName })]] },
+      { range: 'Meta!A1:B2', values: [['key', 'value'], ['manifest', JSON.stringify({ schema: 2, type: 'amygdala-team-sheet', version: 3, pathProtocol: 'project-relative-v1', namespace: spreadsheetId, id: spreadsheetId, folderId, name: cleanName })]] },
       { range: 'Events!A1:B1', values: [['eventId', 'eventJson']] },
       { range: 'Blobs!A1:D1', values: [['hash', 'chunk', 'chunks', 'base64']] },
       { range: 'BlobIndex!A1:D1', values: [['hash', 'size', 'chunks', 'rangesJson']] },
@@ -106,18 +106,24 @@ class TeamSheetStore {
     const manifestText = meta?.values?.[0]?.[1];
     let manifest;
     try { manifest = JSON.parse(manifestText); } catch { throw new Error('В таблице нет манифеста Amygdala или её формат повреждён.'); }
-    if (manifest?.schema !== 1 || manifest.type !== 'amygdala-team-sheet' || manifest.version !== 3
+    if (manifest?.schema !== 2 || manifest.type !== 'amygdala-team-sheet' || manifest.version !== 3
+      || manifest.pathProtocol !== 'project-relative-v1' || manifest.namespace !== this.spreadsheetId
       || manifest.id !== this.spreadsheetId || !TOKEN.test(manifest.folderId || '') || typeof manifest.name !== 'string') {
-      throw new Error('Формат командной таблицы не поддерживается. Выберите таблицу Amygdala 0.3.');
+      throw new Error('Team project uses an unverified or legacy path protocol. Create a new scoped project or prepare an explicit migration plan; existing cloud files were not changed.');
     }
     this.folderId = manifest.folderId;
     const file = await this.driveCall(`/files/${this.spreadsheetId}?fields=id,name,mimeType,trashed,webViewLink,parents,capabilities(canEdit)`);
     if (file.id !== this.spreadsheetId || file.mimeType !== MIME_SHEET || file.trashed || file.capabilities?.canEdit !== true
       || !Array.isArray(file.parents) || !file.parents.includes(this.folderId)) throw new Error('Нужна доступная для редактирования таблица Amygdala в командной папке.');
     return { id: this.spreadsheetId, folderId: this.folderId, name: manifest.name, version: 3, kind: 'team',
+      pathProtocol: manifest.pathProtocol, namespace: manifest.namespace,
       folderName: `Amygdala — ${manifest.name}`, webViewLink: `https://drive.google.com/drive/folders/${this.folderId}`, spreadsheetLink: file.webViewLink };
   }
   async assertAccess() { await this.teamInfo(); }
+  async assertScopeProtocol() {
+    const info = await this.teamInfo();
+    return { pathProtocol: info.pathProtocol, namespace: info.namespace };
+  }
   async actorFor(email) {
     await this.teamInfo();
     if (typeof email !== 'string' || !email.includes('@')) throw new Error('Укажите email Google участника, чтобы проверить права команды.');
@@ -138,7 +144,6 @@ class TeamSheetStore {
   }
   async listEvents() {
     await this.assertAccess();
-    if (this.events) return this.events.map(event => JSON.parse(JSON.stringify(event)));
     const result = await this.values('Events!A2:B');
     const events = new Map();
     for (const row of result.values || []) {
@@ -183,7 +188,6 @@ class TeamSheetStore {
     await flush();
   }
   async loadBlobIndex() {
-    if (this.blobIndex) return this.blobIndex;
     const result = await this.values('BlobIndex!A2:D');
     const index = new Map();
     for (const row of result.values || []) {
@@ -203,6 +207,7 @@ class TeamSheetStore {
     await this.putBlobs([{ hash, data }]);
   }
   async putBlobs(input) {
+    await this.assertScopeProtocol();
     const index = await this.loadBlobIndex(), blobs = new Map();
     for (const { hash, data } of input) {
       if (!HASH.test(hash) || !(data instanceof Uint8Array) || await sha256(data) !== hash) throw new Error('Файл изменился перед загрузкой.');
