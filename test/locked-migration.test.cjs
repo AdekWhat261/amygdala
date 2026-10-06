@@ -127,6 +127,67 @@ test('late duplicate or incomplete D parts remain byte-verifiable backup-only an
   assert.equal(restarted.slots(f.books.get(f.shardIds[0]).metadata, 'D').has(0), true, 'Quarantine still consumes physical capacity');
 });
 
+test('final activation rejects changed protected raw bytes even when legacy header digests still match', async () => {
+  for (const change of ['header-whitespace', 'unparsed-tail']) {
+    const f = await lockFixture(), frozen = await executeSlotLocks(initialApproval(f));
+    const snapshot = await readLockedMigrationSnapshot({ store: f.store, plan: f.plan });
+    const proof = await verifyBackupWithReader(await encodeBackup(await buildVerifiedBackup(snapshot)));
+    const activation = await prepareSlotActivation({ plan: f.plan, shardLocks: frozen.shardLocks,
+      finalFingerprint: proof.sourceFingerprint, finalBackupProof: proof });
+    const book = f.books.get(f.rootId);
+    if (change === 'header-whitespace') book.rows.get(1)[0] = ' ' + book.rows.get(1)[0];
+    else book.rows.set(2, ['unapproved trailing data', '']);
+    const changed = await readLockedMigrationSnapshot({ store: f.store, plan: f.plan });
+    assert.notEqual(changed.fingerprint, proof.sourceFingerprint);
+    await assert.rejects(executeSlotActivation({ plan: f.plan, activation, adapter: f.adapter,
+      approved: true, syncPaused: true, approvalFingerprint: proof.sourceFingerprint, backupProof: proof }), /Полный итоговый снимок изменился/);
+    assert.equal(f.lockBatches.length, 9);
+    assert.equal(hasActivationRange(book.metadata), false);
+  }
+});
+
+test('activation recovery excludes valid later AS5 records but rechecks protected source raw bytes', async () => {
+  const f = await lockFixture(), frozen = await executeSlotLocks(initialApproval(f));
+  const snapshot = await readLockedMigrationSnapshot({ store: f.store, plan: f.plan });
+  const proof = await verifyBackupWithReader(await encodeBackup(await buildVerifiedBackup(snapshot)));
+  const activation = await prepareSlotActivation({ plan: f.plan, shardLocks: frozen.shardLocks,
+    finalFingerprint: proof.sourceFingerprint, finalBackupProof: proof });
+  const args = { plan: f.plan, activation, adapter: f.adapter, approved: true, syncPaused: true,
+    approvalFingerprint: proof.sourceFingerprint, backupProof: proof };
+  await executeSlotActivation(args);
+  const reader = f.make(), bytes = new Uint8Array([21, 42]), hash = await sha256(bytes);
+  await reader.assertAccess();
+  await reader.putBlobs([{ hash, data: bytes }]);
+  await reader.putEvents([{ id: 'after_active_0001', path: 'Later.md', hash, parents: [] }]);
+  const identity = { actorId: 'fixture_permission', actorName: 'Fixture participant' };
+  reader.actorFor = async () => identity;
+  const call = reader.call, rootBook = f.books.get(f.rootId);
+  reader.call = async (url, options = {}) => {
+    if (options.method === 'POST' && url.includes('/values/TeamPlugins') && url.includes(':append?')) {
+      rootBook.teamPluginsRows.push(...copy(options.body.values));
+      rootBook.metadata.sheets.find(sheet => sheet.properties.sheetId === 3).properties.gridProperties.rowCount++;
+      return {};
+    }
+    return call(url, options);
+  };
+  await reader.putTeamPluginChange('propose', { id: 'fixture-plugin', name: 'Fixture Plugin', version: '1.0.0',
+    author: 'Fixture author', description: 'Fixture proposal' }, identity, 'fixture_device');
+  assert.equal((await reader.getTeamPluginCatalog()).plugins.length, 1);
+  // Google metadata ordering does not affect the protected-content fingerprint.
+  for (const book of f.books.values()) book.metadata.namedRanges.reverse();
+  const beforeRetry = f.lockBatches.length;
+  const resumed = await executeSlotActivation(args);
+  assert.equal(resumed.state, 'complete'); assert.equal(resumed.writes, 0);
+  assert.equal(f.lockBatches.length, beforeRetry);
+  await assert.rejects(readLockedMigrationSnapshot({ store: f.store, plan: f.plan }), /до активации/);
+  rootBook.teamPluginsRows[0][0] = 'modified original header';
+  await assert.rejects(executeSlotActivation(args), /Исходные строки командных плагинов изменились/);
+  rootBook.teamPluginsRows[0][0] = 'changeId';
+  f.books.get(f.rootId).rows.get(1)[0] = ' ' + f.books.get(f.rootId).rows.get(1)[0];
+  await assert.rejects(executeSlotActivation(args), /Полный итоговый снимок изменился/);
+  assert.equal(f.lockBatches.length, beforeRetry);
+});
+
 test('v2 negative probe requires exact consent and rejects a mutation-first batch without changing source', async () => {
   const f = await lockFixture();
   await assert.rejects(probeGoogleLockAtomicity({ store: f.store, plan: f.plan }));

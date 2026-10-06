@@ -1,6 +1,7 @@
 'use strict';
 
 const { validateLockedPlan } = require('./locked-migration.cjs');
+const { readFrozenSnapshotPass } = require('./locked-snapshot-content.cjs');
 const { LOCK_PROTOCOL, LOCK_RANGE_NAME, LOCK_ROW_KEY, LOCK_RANGE,
   ACTIVE_RANGE_NAME, ACTIVE_ROW_KEY, ACTIVE_RANGE, LIMITS,
   canonical, fenceDigest, namedSlots, allocationMarker, sourceRecordsDigest,
@@ -63,6 +64,14 @@ function createGoogleLockAdapter({ store, plan } = {}) {
         && item.properties.gridProperties?.rowCount >= 1 + LIMITS[kind].physical * LIMITS[kind].blocks
         && item.properties.gridProperties?.columnCount >= 2)) fail('Таблица изменилась или недоступна.');
     const old = namedSlots(metadata, kind), fresh = namedSlots(metadata, kind, 'AS5');
+    let active = null;
+    if (hasActivationRange(metadata)) {
+      if (kind !== 'C') fail('Активация найдена в сегменте данных.');
+      assertActivationRange(metadata); active = parseSlotActivation(activeRows.values || []);
+      if (active.lockId !== plan.rootLock.lockId || active.rootId !== plan.rootId
+        || active.rootLockDigest !== await fenceDigest(plan.rootLock) || active.epoch !== await activationEpoch(active))
+        fail('Другая операция активации.');
+    } else if (nonempty(activeRows.values)) fail('Ячейка активации занята неизвестными данными.');
     const original = plan.sourceSheets.find(sheet => sheet.id === id).metadata;
     const stripped = clone(metadata), baseline = new Set(approved.sourceSlots);
     // Only new protocol controls and new old-client D allocations may differ.
@@ -77,17 +86,19 @@ function createGoogleLockAdapter({ store, plan } = {}) {
       value.sheets = (value.sheets || []).sort((a, b) => a.properties.sheetId - b.properties.sheetId);
       return value;
     };
+    if (active && kind === 'C') {
+      const before = original.sheets?.find(sheet => sheet.properties?.sheetId === 3);
+      const current = stripped.sheets?.find(sheet => sheet.properties?.sheetId === 3);
+      if (!before || !current || current.properties.gridProperties.rowCount < before.properties.gridProperties.rowCount)
+        fail('Изменилась согласованная структура журнала плагинов.');
+      current.properties.gridProperties.rowCount = before.properties.gridProperties.rowCount;
+    }
     if (!same(normalize(stripped), normalize(original))) fail('Изменилась согласованная структура таблицы.');
-    if (id === plan.rootId && await fenceDigest((await store.values(id, 'TeamPlugins!A1:C')).values || []) !== plan.teamPluginsDigest)
-      fail('Список командных плагинов изменился.');
-    let active = null;
-    if (hasActivationRange(metadata)) {
-      if (kind !== 'C') fail('Активация найдена в сегменте данных.');
-      assertActivationRange(metadata); active = parseSlotActivation(activeRows.values || []);
-      if (active.lockId !== plan.rootLock.lockId || active.rootId !== plan.rootId
-        || active.rootLockDigest !== await fenceDigest(plan.rootLock) || active.epoch !== await activationEpoch(active))
-        fail('Другая операция активации.');
-    } else if (nonempty(activeRows.values)) fail('Ячейка активации занята неизвестными данными.');
+    if (id === plan.rootId) {
+      if (active) await store.pluginChanges();
+      else if (await fenceDigest((await store.values(id, 'TeamPlugins!A1:C')).values || []) !== plan.teamPluginsDigest)
+        fail('Список командных плагинов изменился.');
+    }
     let lock, sourceSlots;
     if (hasLockRange(metadata)) {
       assertLockRange(metadata); lock = parseSlotLock(lockRows.values || []);
@@ -159,6 +170,9 @@ function createGoogleLockAdapter({ store, plan } = {}) {
         || activation.shardReceiptDigests[index].digest !== await fenceDigest(locks[index])) fail('Итоговые сегменты изменились.');
       const state = await readState(plan.rootId);
       if (state.active && !same(state.active, activation)) fail('Уже существует другая активация.');
+      const frozen = await readFrozenSnapshotPass({ store, plan, readState, allowActive: Boolean(state.active) });
+      if (frozen.fingerprint !== activation.sourceFingerprint)
+        fail('Полный итоговый снимок изменился после проверки копии. Нужны новая копия и разрешение.');
       return { state: state.active ? 'active' : 'locked' };
     },
     async claimActivation(activation) {

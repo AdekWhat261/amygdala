@@ -11,13 +11,7 @@ const { validateCatalog } = require('./team-plugins.cjs');
 const { normalizeFolderPath, isExcluded } = require('./planner.cjs');
 const { connectionStatus: formatConnectionStatus } = require('./connection-status.cjs');
 const { checkGoogleProjectAccess } = require('./google-access-check.cjs');
-const { readOnlySchema2MigrationPreview, readOnlyMigrationSnapshot } = require('./legacy-migration-remote-preview.cjs');
-const { prepareFencedMigration, createGoogleFenceAdapter, executeFencedMigration, probeGoogleFenceAtomicity } = require('./fenced-migration.cjs');
-const { buildVerifiedBackup, encodeBackup } = require('./verified-backup.cjs');
-const { verifyBackupWithReader } = require('./backup-reader-verification.cjs');
-// V1 cannot safely adopt late legacy commits. Keep this UI path disabled until
-// the tested V2 lock/backup/separate-activation flow is integrated here.
-const FENCED_MIGRATION_LIVE_BLOCKER = 'Запись миграции заблокирована: новый механизм остановки старых клиентов и отдельной активации после проверенной копии ещё не подключён к этому интерфейсу. Отметка об остановке синхронизации не снимает блок.';
+const { createLockedMigrationMethods } = require('./locked-migration-plugin.cjs');
 const config = ({
   "bridgeUrl": "https://easy-sync-login.igor-ryabkov.chatgpt.site",
   "beta": true,
@@ -226,268 +220,6 @@ class EasySync extends Plugin {
       new Notice(message, 8000);
       return false;
     } finally { this.checkingGoogleAccess = false; }
-  }
-  async previewTeamMigration() {
-    if (this.connectionAuthMode() !== 'team-v4') throw new Error('Для просмотра миграции подключите командный проект v4.');
-    if (this.prefs?.auto !== false) throw new Error('Перед просмотром миграции выключите автосинхронизацию у всех участников.');
-    if (this.running || this.checkingGoogleAccess || this.migrationPreviewing || this.migrationPreparing || this.migrationApplying) throw new Error('Дождитесь завершения текущей операции Amygdala.');
-    if (this.pluginData?.fencedMigrationPreparations?.[this.connection.id]?.attempted)
-      throw new Error('Миграция уже начата. Используйте сохранённый план и «Продолжить миграцию», без нового снимка.');
-    const scopePath = this.teamScopePath();
-    if (!scopePath) throw new Error('Перед просмотром миграции выберите существующую Shared внутри этого хранилища.');
-    this.migrationPreviewing = true;
-    this.migrationAllParticipantsPaused = false;
-    this.migrationWriteApprovedFingerprint = null;
-    this.setTransientStatus('Читаю сведения девяти таблиц, историю и вложения для проверки. Запись и синхронизация не запускаются.');
-    try {
-      const store = new TeamShardedStore({ rootId: this.connection.id, request: requestUrl,
-        getAccessToken: () => this.v4Auth.accessToken(), refreshAccessToken: () => this.v4Auth.accessToken(true),
-        limiter: this.sheetsLimiter, progress: state => { this.progress = state; } });
-      const report = await readOnlySchema2MigrationPreview({ store, scopePath });
-      this.lastMigrationPreview = report;
-      if (this.matchesApprovedMigrationPreview(report) && report.migrationState === 'source')
-        this.approvedMigrationEventFingerprint = report.eventFingerprint;
-      const paths = report.pathCounts;
-      const summary = `Миграция: проверен стабильный снимок (${report.migrationState}). Всего ${report.revisionCount} записей; в области Shared — ${paths['inside-selected-folder']}, вне её — ${paths['outside-selected-folder']}, с неоднозначным регистром — ${paths['case-ambiguous']}. В карантине останутся ${report.quarantinedRevisionCount} записей; история и вложения сохраняются. Проверены ${report.uniqueReferencedBlobs} вложения (${report.referencedBlobBytes} байт). Изменений: 0. Таблицы и SHA-256 показаны ниже.`;
-      this.setTransientStatus(summary);
-      new Notice(summary, 15000);
-      return report;
-    } catch (error) {
-      const message = error?.message || 'Не удалось прочитать предварительный результат миграции.';
-      this.setTransientStatus(message);
-      new Notice(message, 12000);
-      return null;
-    } finally { this.migrationPreviewing = false; }
-  }
-  canPrepareTeamMigration() {
-    const rootId = this.connection?.id;
-    return this.connectionAuthMode() === 'team-v4' && this.prefs?.auto === false && Boolean(this.teamScopePath())
-      && /^[A-Za-z0-9_-]{8,128}$/.test(rootId || '') && !this.stopped && !this.running
-      && !this.checkingGoogleAccess && !this.migrationPreviewing && !this.migrationPreparing && !this.migrationApplying
-      && !this.pluginData?.fencedMigrationPreparations?.[rootId]?.attempted
-      && Object.keys(this.pluginData?.v4ScopedOperations?.[rootId] || {}).length === 0;
-  }
-  migrationPreviewForPlan(plan, source = {}) {
-    const report = plan.report || {}, preview = {};
-    for (const key of ['sourceSchema', 'targetSchema', 'revisionCount', 'currentPathCount', 'pathCounts',
-      'quarantinedRevisionCount', 'activeLegacyRevisionCount', 'includedCurrentPathCount', 'quarantinedCurrentPathCount',
-      'uniqueReferencedBlobs', 'referencedBlobBytes']) {
-      const value = source[key] ?? report[key];
-      if (value !== undefined) preview[key] = structuredClone(value);
-    }
-    return { ...preview, sourceSchema: 2, targetSchema: 3, stableSnapshot: true, remoteWrites: 0,
-      migrationState: source.migrationState || 'source', activeProjectEventCount: source.activeProjectEventCount || 0,
-      projectRootId: plan.rootId, shardIds: [...plan.shardIds], localScope: plan.scopePath,
-      snapshotFingerprint: plan.sourceFingerprint, eventFingerprint: source.eventFingerprint };
-  }
-  restorePreparedMigrationCandidate() {
-    const rootId = this.connection?.id, saved = this.pluginData?.fencedMigrationPreparations?.[rootId];
-    this.migrationPreparationEligibility = null;
-    this.migrationWriteApprovedFingerprint = null;
-    this.migrationAllParticipantsPaused = false;
-    if (this.connectionAuthMode() !== 'team-v4' || saved?.plan?.rootId !== rootId
-      || saved.plan.scopePath !== this.teamScopePath()) return;
-    this.migrationPreparationEligibility = { rootId, scopePath: saved.plan.scopePath, generation: this.autoSyncGeneration || 0 };
-    if (!this.preparedTeamMigration()) { this.migrationPreparationEligibility = null; return; }
-    this.lastMigrationPreview = this.migrationPreviewForPlan(saved.plan, { ...saved.preview,
-      migrationState: saved.completed ? 'complete' : saved.attempted ? 'partial' : 'source' });
-  }
-  preparedTeamMigration() {
-    const rootId = this.connection?.id, selected = this.migrationPreparationEligibility;
-    const saved = this.pluginData?.fencedMigrationPreparations?.[rootId];
-    if (!selected || this.connectionAuthMode() !== 'team-v4' || selected.rootId !== rootId
-      || selected.scopePath !== this.teamScopePath() || selected.generation !== (this.autoSyncGeneration || 0)
-      || saved?.plan?.rootId !== rootId || saved.plan.scopePath !== selected.scopePath
-      || !/^[a-f0-9]{64}$/.test(saved.plan.sourceFingerprint || '')
-      || !/^[a-f0-9]{64}$/.test(saved.plan.backupBundleSha256 || '')
-      || saved.backupPath !== `.easy-sync/recovery/migration/${rootId}/${saved.plan.backupBundleSha256}.json`
-      || saved.proof?.verified !== true || saved.proof.bundleSha256 !== saved.plan.backupBundleSha256
-      || saved.proof.sourceFingerprint !== saved.plan.sourceFingerprint || saved.proof.projectRootId !== rootId) return null;
-    return saved;
-  }
-  async prepareTeamMigration() {
-    if (!this.canPrepareTeamMigration())
-      throw new Error('Для резервной копии выберите Shared командного проекта v4, выключите автосинхронизацию и завершите текущие и ожидающие операции.');
-    const connection = this.connection, connectionIdentity = JSON.stringify(connection), rootId = connection.id;
-    const scopePath = this.teamScopePath(), generation = this.autoSyncGeneration || 0;
-    const lock = `team-${this.device}-${rootId}`;
-    if (globalThis[LOCKS].has(lock)) throw new Error('Для этого проекта уже выполняется операция.');
-    const adapter = this.app.vault.adapter;
-    if (!adapter || typeof adapter.readBinary !== 'function' || typeof adapter.writeBinary !== 'function')
-      throw new Error('Локальное сохранение и проверка резервной копии недоступны.');
-    const assertUnchanged = () => {
-      if (this.stopped || this.connection !== connection || JSON.stringify(this.connection) !== connectionIdentity
-        || this.teamScopePath() !== scopePath || (this.autoSyncGeneration || 0) !== generation || this.prefs?.auto !== false
-        || Object.keys(this.pluginData?.v4ScopedOperations?.[rootId] || {}).length)
-        throw new Error('Проект, папка или очередь изменились. Подготовка не даёт разрешения на миграцию; повторите её для текущего состояния.');
-    };
-    globalThis[LOCKS].add(lock);
-    this.migrationPreparing = true;
-    this.migrationPreparationEligibility = null;
-    this.migrationWriteApprovedFingerprint = null;
-    this.migrationAllParticipantsPaused = false;
-    this.setTransientStatus('Читаю полный снимок девяти таблиц для локальной резервной копии. Записи в Google и синхронизации нет.');
-    try {
-      const store = new TeamShardedStore({ rootId, request: requestUrl,
-        getAccessToken: () => this.v4Auth.accessToken(), refreshAccessToken: () => this.v4Auth.accessToken(true),
-        limiter: this.sheetsLimiter, progress: state => { this.progress = state; } });
-      const snapshot = await readOnlyMigrationSnapshot({ store, scopePath, verifyBlobs: true, includeBackupData: true });
-      assertUnchanged();
-      const plan = await prepareFencedMigration(snapshot);
-      const backup = await buildVerifiedBackup(snapshot.backupSnapshot);
-      if (plan.rootId !== rootId || plan.scopePath !== scopePath || plan.sourceFingerprint !== snapshot.fingerprint
-        || plan.backupBundleSha256 !== backup.bundleSha256 || backup.project.rootId !== rootId
-        || backup.sourceFingerprint !== plan.sourceFingerprint || !/^[a-f0-9]{64}$/.test(backup.bundleSha256 || ''))
-        throw new Error('План и резервная копия относятся к разным снимкам. Подготовка остановлена.');
-      const bytes = await encodeBackup(backup);
-      const directory = `.easy-sync/recovery/migration/${rootId}`;
-      const backupPath = `${directory}/${backup.bundleSha256}.json`;
-      assertUnchanged();
-      await this.ensureAdapterDirectory(directory);
-      assertUnchanged();
-      if (!await adapter.exists(backupPath)) {
-        assertUnchanged();
-        await adapter.writeBinary(backupPath, bytes.slice().buffer);
-      }
-      const savedBytes = new Uint8Array(await adapter.readBinary(backupPath));
-      if (savedBytes.length !== bytes.length || !savedBytes.every((byte, index) => byte === bytes[index]))
-        throw new Error('Сохранённая резервная копия не совпала с подготовленной. Существующий файл не перезаписан; миграция запрещена.');
-      assertUnchanged();
-      this.setTransientStatus('Копия сохранена локально. Проверяю восстановление в памяти через штатный модуль чтения; Google не изменяется.');
-      const proof = await verifyBackupWithReader(savedBytes);
-      if (proof.verified !== true || proof.bundleSha256 !== plan.backupBundleSha256
-        || proof.sourceFingerprint !== plan.sourceFingerprint || proof.projectRootId !== rootId)
-        throw new Error('Проверка восстановления не подтвердила именно этот снимок проекта.');
-      assertUnchanged();
-      const preparation = { plan, backupPath, proof, preview: this.migrationPreviewForPlan(plan, snapshot) };
-      await this.persistPluginData(data => {
-        assertUnchanged();
-        data.fencedMigrationPreparations ||= {};
-        data.fencedMigrationPreparations[rootId] = preparation;
-      });
-      assertUnchanged();
-      this.migrationPreparationEligibility = { rootId, scopePath, generation };
-      this.lastMigrationPreview = preparation.preview;
-      const summary = `Локальная копия проверена: ${proof.revisionCount} записей, ${proof.blobGroups} групп вложений, ${proof.allBlobBytes} байт. Полных групп: ${proof.completeBlobGroups}; неполных без ссылок: ${proof.incompleteBlobGroups}. Восстановление проверено в памяти. Записей в Google: 0; синхронизация не запускалась. ${this.migrationLiveWriteBlocker() || 'Миграция требует отдельного разрешения для снимка ниже.'}`;
-      this.setTransientStatus(summary); new Notice(summary, 15000);
-      return preparation;
-    } catch (error) {
-      this.migrationPreparationEligibility = null;
-      const message = error?.message || 'Не удалось подготовить и проверить локальную резервную копию.';
-      this.setTransientStatus(message); new Notice(message, 12000);
-      return null;
-    } finally { this.migrationPreparing = false; globalThis[LOCKS].delete(lock); }
-  }
-  renderMigrationPreparation(el, onChanged) {
-    if (this.connectionAuthMode() !== 'team-v4') return;
-    new Setting(el).setName('Резервная копия перед миграцией')
-      .setDesc('Читает полные данные девяти таблиц, сохраняет копию в скрытой папке восстановления этого хранилища и проверяет восстановление в памяти. Ничего не записывает в Google и не запускает синхронизацию.')
-      .addButton(b => b.setButtonText('Подготовить резервную копию').setDisabled(!this.canPrepareTeamMigration())
-        .onClick(async () => {
-          b.setDisabled(true);
-          try { await this.prepareTeamMigration(); } catch (error) { this.report(error); }
-          await onChanged?.();
-        }));
-    const prepared = this.preparedTeamMigration();
-    if (prepared) el.createEl('p', { text: prepared.completed
-      ? 'Миграция этого плана завершена и проверена. Резервная копия сохранена; автосинхронизация выключена. Приёмка на реальных устройствах проводится отдельно.'
-      : `Копия проверена локально: ${prepared.proof.revisionCount} записей, ${prepared.proof.blobGroups} групп вложений, ${prepared.proof.allBlobBytes} байт. Это не проверка живой миграции. ${this.migrationLiveWriteBlocker() || (prepared.attempted ? 'Сохранён исходный план для продолжения.' : 'Для записи требуется отдельное разрешение ниже.')}` });
-  }
-  matchesApprovedMigrationPreview(report = this.lastMigrationPreview) {
-    const paths = report?.pathCounts;
-    if (!report || report.sourceSchema !== 2 || report.targetSchema !== 3 || !report.stableSnapshot
-      || typeof report.localScope !== 'string' || !report.localScope || report.remoteWrites !== 0
-      || !paths || paths['inside-selected-folder'] + paths['outside-selected-folder'] + paths['case-ambiguous'] !== report.revisionCount
-      || report.activeLegacyRevisionCount !== paths['inside-selected-folder']
-      || report.quarantinedRevisionCount !== paths['outside-selected-folder'] + paths['case-ambiguous']
-      || !/^[a-f0-9]{64}$/.test(report.snapshotFingerprint || '')
-      || !/^[a-f0-9]{64}$/.test(report.eventFingerprint || '')) return false;
-    if (report.migrationState === 'source') return true;
-    return report.migrationState === 'partial' && Boolean(this.approvedMigrationEventFingerprint)
-      && report.eventFingerprint === this.approvedMigrationEventFingerprint;
-  }
-  migrationLiveWriteBlocker() { return FENCED_MIGRATION_LIVE_BLOCKER; }
-  canApplyTeamMigration() {
-    if (this.migrationLiveWriteBlocker()) return false;
-    const prepared = this.preparedTeamMigration();
-    return Boolean(prepared && !prepared.completed && !this.stopped && this.connectionAuthMode() === 'team-v4' && this.prefs?.auto === false && !this.running
-      && !this.checkingGoogleAccess
-      && !this.migrationPreviewing && !this.migrationPreparing && !this.migrationApplying && this.migrationAllParticipantsPaused === true
-      && Object.keys(this.pluginData?.v4ScopedOperations?.[prepared.plan.rootId] || {}).length === 0
-      && this.lastMigrationPreview?.projectRootId === prepared.plan.rootId
-      && this.teamScopePath() === this.lastMigrationPreview?.localScope
-      && this.lastMigrationPreview?.snapshotFingerprint === prepared.plan.sourceFingerprint
-      && this.migrationWriteApprovedFingerprint === prepared.plan.sourceFingerprint);
-  }
-  async applyTeamMigration() {
-    if (this.migrationLiveWriteBlocker()) throw new Error(this.migrationLiveWriteBlocker());
-    if (!this.canApplyTeamMigration()) throw new Error('Миграция недоступна: нужна проверенная копия выбранного проекта, разрешение для точного снимка и остановленная синхронизация всех участников.');
-    const prepared = this.preparedTeamMigration(), plan = structuredClone(prepared.plan), planIdentity = JSON.stringify(prepared.plan);
-    const connection = this.connection, connectionIdentity = JSON.stringify(connection), generation = this.autoSyncGeneration || 0;
-    const rootId = plan.rootId, scopePath = plan.scopePath, lock = `team-${this.device}-${rootId}`;
-    if (globalThis[LOCKS].has(lock)) throw new Error('Для этого проекта уже выполняется операция.');
-    const assertUnchanged = () => {
-      if (this.migrationLiveWriteBlocker() || this.stopped || this.connection !== connection || JSON.stringify(this.connection) !== connectionIdentity
-        || this.teamScopePath() !== scopePath || (this.autoSyncGeneration || 0) !== generation || this.prefs?.auto !== false
-        || this.migrationWriteApprovedFingerprint !== plan.sourceFingerprint || this.migrationAllParticipantsPaused !== true
-        || Object.keys(this.pluginData?.v4ScopedOperations?.[rootId] || {}).length
-        || JSON.stringify(this.pluginData?.fencedMigrationPreparations?.[rootId]?.plan) !== planIdentity)
-        throw new Error('Область, согласование или очередь изменились. Записи остановлены; исходный план сохранён для проверки и продолжения.');
-    };
-    const guarded = async operation => { assertUnchanged(); const result = await operation(); assertUnchanged(); return result; };
-    const validAtomicProof = proof => proof?.verified === true && proof.projectRootId === rootId
-      && proof.sourceFingerprint === plan.sourceFingerprint && proof.operation === 'duplicate-named-range-atomic-rejection'
-      && /^[a-f0-9]{64}$/.test(proof.proofDigest || '');
-    const persist = async patch => guarded(() => this.persistPluginData(data => {
-      assertUnchanged(); Object.assign(data.fencedMigrationPreparations[rootId], patch);
-    }));
-    globalThis[LOCKS].add(lock);
-    this.migrationApplying = true;
-    this.setTransientStatus('Повторно проверяю сохранённую копию и исходный план перед согласованной миграцией. Автосинхронизация выключена.');
-    try {
-      const bytes = new Uint8Array(await guarded(() => this.app.vault.adapter.readBinary(prepared.backupPath)));
-      const proof = await guarded(() => verifyBackupWithReader(bytes));
-      if (proof?.verified !== true || proof.bundleSha256 !== plan.backupBundleSha256
-        || proof.sourceFingerprint !== plan.sourceFingerprint || proof.projectRootId !== rootId)
-        throw new Error('Сохранённая копия не подтвердила исходный план. Записей не было.');
-      const store = new TeamShardedStore({ rootId, request: requestUrl,
-        getAccessToken: () => this.v4Auth.accessToken(), refreshAccessToken: () => this.v4Auth.accessToken(true),
-        limiter: this.sheetsLimiter, progress: state => { this.progress = state; } });
-      const call = store.call.bind(store);
-      store.call = (...args) => guarded(() => call(...args));
-      const rawAdapter = createGoogleFenceAdapter({ store, plan });
-      const adapter = Object.fromEntries(['readState', 'claimFence', 'verifyActivation'].map(name => [name,
-        (...args) => guarded(() => rawAdapter[name](...args))]));
-      // Preflight every original receipt before even the approved negative probe.
-      for (const receipt of plan.receipts) {
-        const state = await adapter.readState(receipt);
-        if (!['source', 'fenced'].includes(state?.state)) throw new Error('Неизвестное состояние таблицы. Запись остановлена.');
-      }
-      let atomicFenceProof = prepared.atomicFenceProof;
-      if (atomicFenceProof && !validAtomicProof(atomicFenceProof))
-        throw new Error('Сохранённое доказательство Google относится к другому плану. Продолжение остановлено.');
-      await persist({ attempted: true, status: 'applying', proof });
-      this.lastMigrationPreview = { ...this.lastMigrationPreview, migrationState: 'partial' };
-      if (!atomicFenceProof) {
-        atomicFenceProof = await guarded(() => probeGoogleFenceAtomicity({ store, plan, approved: true,
-          approvalFingerprint: plan.sourceFingerprint }));
-        if (!validAtomicProof(atomicFenceProof)) throw new Error('Google не подтвердил атомарный отказ. Защита таблиц не записывалась.');
-        await persist({ atomicFenceProof });
-      }
-      const result = await guarded(() => executeFencedMigration({ plan, adapter, approved: true, syncPaused: true,
-        approvalFingerprint: plan.sourceFingerprint, backupProof: proof, atomicFenceProof }));
-      if (result?.state !== 'complete' || result.epoch !== plan.epoch || result.sourceFingerprint !== plan.sourceFingerprint)
-        throw new Error('Завершение именно этого плана не подтверждено. Исходный план сохранён.');
-      await persist({ completed: true, status: 'complete', result });
-      this.lastMigrationPreview = { ...this.lastMigrationPreview, migrationState: 'complete' };
-      const message = `Миграция проверена и завершена: защищены девять таблиц; на этом проходе — ${result.writes} операций. Исходные записи и резервная копия сохранены. Автосинхронизация выключена. Приёмка на устройствах ещё не выполнена.`;
-      this.setTransientStatus(message); new Notice(message, 15000);
-      return result;
-    } catch (error) {
-      const message = `${error?.message || 'Миграция остановлена.'} Исходный план и резервная копия сохранены. Полученное доказательство Google также сохраняется. Незавершённый план можно продолжить после устранения причины остановки.`;
-      this.setTransientStatus(message); new Notice(message, 15000);
-      return null;
-    } finally { this.migrationApplying = false; globalThis[LOCKS].delete(lock); }
   }
   teamScopeKey(connection = this.connection) {
     return connection?.kind === 'team' && connection.id ? `amygdala-team-scope-${connection.id}` : null;
@@ -983,37 +715,9 @@ class ConnectModal extends Modal {
         }));
       if (p.connection.kind === 'team' && p.connection.version === 4) new Setting(el).setName('Предварительная проверка миграции')
         .setDesc('При выключенной автосинхронизации читает девять таблиц, историю и вложения, проверяет контрольные суммы. Показывает количество путей, таблицы и результат проверки. Ничего не записывает.')
-        .addButton(b => b.setButtonText('Проверить миграцию').setDisabled(p.prefs?.auto !== false || !p.teamScopePath() || p.running || p.migrationPreviewing || p.migrationPreparing || p.migrationApplying || p.pluginData?.fencedMigrationPreparations?.[p.connection.id]?.attempted)
+        .addButton(b => b.setButtonText('Проверить миграцию').setDisabled(p.prefs?.auto !== false || !p.teamScopePath() || p.running || p.migrationPreviewing || p.migrationPreparing || p.migrationApplying || (p.pluginData?.fencedMigrationPreparations?.[p.connection.id] || p.pluginData?.lockedMigrationPreparations?.[p.connection.id]))
           .onClick(async () => { b.setDisabled(true); await p.previewTeamMigration(); await this.render(); }));
       p.renderMigrationPreparation(el, () => this.render());
-      if (p.lastMigrationPreview && p.lastMigrationPreview.migrationState !== 'complete') {
-        el.createEl('pre', { text: [
-          p.lastMigrationPreview.migrationState === 'partial' ? 'Сохранённый исходный план. Часть таблиц уже может быть защищена.' : 'Результат проверки миграции. Изменений ещё не было.',
-          `Локальная папка Shared: ${p.lastMigrationPreview.localScope}`,
-          `Схема: ${p.lastMigrationPreview.sourceSchema} → ${p.lastMigrationPreview.targetSchema}`,
-          `Основная таблица: ${p.lastMigrationPreview.projectRootId}`,
-          `Таблицы данных: ${p.lastMigrationPreview.shardIds.join(', ')}`,
-          `Старые записи в области проекта: ${p.lastMigrationPreview.activeLegacyRevisionCount} (${p.lastMigrationPreview.includedCurrentPathCount} текущих путей)`,
-          `Старые записи в карантине: ${p.lastMigrationPreview.quarantinedRevisionCount} (${p.lastMigrationPreview.quarantinedCurrentPathCount} текущих путей); история и вложения сохраняются`,
-          `Новые записи проекта: ${p.lastMigrationPreview.activeProjectEventCount}`,
-          `Контрольная сумма снимка SHA-256: ${p.lastMigrationPreview.snapshotFingerprint}`
-        ].join('\n') });
-        new Setting(el).setName('Все участники остановили синхронизацию')
-          .setDesc('Подтвердите, что у всех участников выключена автосинхронизация и сейчас никто не синхронизирует вручную.')
-          .addToggle(t => t.setValue(p.migrationAllParticipantsPaused === true).onChange(value => {
-            p.migrationAllParticipantsPaused = value; void this.render();
-          }));
-        new Setting(el).setName('Разрешить именно эту миграцию')
-          .setDesc('Разрешение для полной контрольной суммы выше: проверить атомарный отказ Google и защитить девять таблиц по сохранённому плану. Исходные данные не удаляются. Все участники должны остановить синхронизацию.')
-          .addToggle(t => t.setValue(p.migrationWriteApprovedFingerprint === p.lastMigrationPreview.snapshotFingerprint).onChange(value => {
-            p.migrationWriteApprovedFingerprint = value ? p.lastMigrationPreview.snapshotFingerprint : null; void this.render();
-          }));
-        new Setting(el).setName('Выполнить согласованную миграцию')
-          .setDesc(p.migrationLiveWriteBlocker() || 'Перед записью повторно проверяет сохранённую копию и все девять таблиц. При продолжении использует тот же план и эпоху; синхронизацию не запускает.')
-          .addButton(b => b.setButtonText(p.lastMigrationPreview.migrationState === 'partial' ? 'Продолжить миграцию' : 'Выполнить миграцию')
-            .setDisabled(!p.canApplyTeamMigration())
-            .onClick(async () => { b.setDisabled(true); await p.applyTeamMigration(); await this.render(); }));
-      }
       const statusText = el.createEl('p', { text: p.label });
       const progress = el.createDiv({ cls: 'easy-sync-progress' });
       const progressText = progress.createEl('div', { cls: 'easy-sync-progress-text' });
@@ -1212,37 +916,9 @@ class SyncSettings extends PluginSettingTab {
       }));
     if (p.connection?.kind === 'team' && p.connection.version === 4) new Setting(el).setName('Предварительная проверка миграции')
       .setDesc('Выключите автосинхронизацию и выберите папку проекта. Проверка читает девять таблиц, историю и вложения. Показывает количество путей, таблицы и контрольную сумму. Ничего не записывает.')
-      .addButton(b => b.setButtonText('Проверить миграцию').setDisabled(p.prefs?.auto !== false || !p.teamScopePath() || p.running || p.migrationPreviewing || p.migrationPreparing || p.migrationApplying || p.pluginData?.fencedMigrationPreparations?.[p.connection.id]?.attempted)
+      .addButton(b => b.setButtonText('Проверить миграцию').setDisabled(p.prefs?.auto !== false || !p.teamScopePath() || p.running || p.migrationPreviewing || p.migrationPreparing || p.migrationApplying || (p.pluginData?.fencedMigrationPreparations?.[p.connection.id] || p.pluginData?.lockedMigrationPreparations?.[p.connection.id]))
         .onClick(async () => { b.setDisabled(true); await p.previewTeamMigration(); this.display(); }));
     p.renderMigrationPreparation(el, () => this.display());
-    if (p.lastMigrationPreview && p.lastMigrationPreview.migrationState !== 'complete') {
-      el.createEl('pre', { text: [
-        p.lastMigrationPreview.migrationState === 'partial' ? 'Сохранённый исходный план. Часть таблиц уже может быть защищена.' : 'Результат проверки миграции. Изменений ещё не было.',
-        `Локальная папка Shared: ${p.lastMigrationPreview.localScope}`,
-        `Схема: ${p.lastMigrationPreview.sourceSchema} → ${p.lastMigrationPreview.targetSchema}`,
-        `Основная таблица: ${p.lastMigrationPreview.projectRootId}`,
-        `Таблицы данных: ${p.lastMigrationPreview.shardIds.join(', ')}`,
-        `Старые записи в области проекта: ${p.lastMigrationPreview.activeLegacyRevisionCount} (${p.lastMigrationPreview.includedCurrentPathCount} текущих путей)`,
-        `Старые записи в карантине: ${p.lastMigrationPreview.quarantinedRevisionCount} (${p.lastMigrationPreview.quarantinedCurrentPathCount} текущих путей); история и вложения сохраняются`,
-        `Новые записи проекта: ${p.lastMigrationPreview.activeProjectEventCount}`,
-        `Контрольная сумма снимка SHA-256: ${p.lastMigrationPreview.snapshotFingerprint}`
-      ].join('\n') });
-      new Setting(el).setName('Все участники остановили синхронизацию')
-        .setDesc('Подтвердите, что у всех участников выключена автосинхронизация и сейчас никто не синхронизирует вручную.')
-        .addToggle(t => t.setValue(p.migrationAllParticipantsPaused === true).onChange(value => {
-          p.migrationAllParticipantsPaused = value; this.display();
-        }));
-      new Setting(el).setName('Разрешить именно эту миграцию')
-        .setDesc('Разрешение для полной контрольной суммы выше: проверить атомарный отказ Google и защитить девять таблиц по сохранённому плану. Исходные данные не удаляются. Все участники должны остановить синхронизацию.')
-        .addToggle(t => t.setValue(p.migrationWriteApprovedFingerprint === p.lastMigrationPreview.snapshotFingerprint).onChange(value => {
-          p.migrationWriteApprovedFingerprint = value ? p.lastMigrationPreview.snapshotFingerprint : null; this.display();
-        }));
-      new Setting(el).setName('Выполнить согласованную миграцию')
-        .setDesc(p.migrationLiveWriteBlocker() || 'Перед записью повторно проверяет сохранённую копию и все девять таблиц. При продолжении использует тот же план и эпоху; синхронизацию не запускает.')
-        .addButton(b => b.setButtonText(p.lastMigrationPreview.migrationState === 'partial' ? 'Продолжить миграцию' : 'Выполнить миграцию')
-          .setDisabled(!p.canApplyTeamMigration())
-          .onClick(async () => { b.setDisabled(true); await p.applyTeamMigration(); this.display(); }));
-    }
     new Setting(el).setName('Google Drive').setDesc(p.googleConnectionStatus().text)
       .addButton(b => b.setButtonText('Подключение').onClick(() => new ConnectModal(p).open()));
     new Setting(el).setName('Автоматическая синхронизация').setDesc('Раз в минуту, пока Obsidian открыт, и при возвращении в приложение. В фоне телефона синхронизация не гарантируется.')
@@ -1477,4 +1153,10 @@ class PrivateNoteLinkModal extends Modal {
   onClose() { this.contentEl.empty(); }
 }
 
+Object.assign(EasySync.prototype, createLockedMigrationMethods({
+  Setting, Notice, locks: globalThis[LOCKS],
+  createStore: (plugin, rootId) => new TeamShardedStore({ rootId, request: requestUrl,
+    getAccessToken: () => plugin.v4Auth.accessToken(), refreshAccessToken: () => plugin.v4Auth.accessToken(true),
+    limiter: plugin.sheetsLimiter, progress: state => { plugin.progress = state; } })
+}));
 module.exports = EasySync;

@@ -12,6 +12,7 @@ async function lockFixture(options = {}) {
   function wire(store) {
     const previousValues = store.values;
     store.values = async (id, range) => {
+      if (range === 'TeamPlugins!A2:C') return { values: copy((f.books.get(id).teamPluginsRows || []).slice(1)) };
       const match = /^Meta!A(\d+):B(\d+)$/.exec(range);
       if (!match) return previousValues(id, range);
       const book = f.books.get(id), rows = [['key', 'value'], ['manifest', JSON.stringify(book.manifest)],

@@ -36,6 +36,7 @@ async function prepareLockedMigration(snapshot, options) {
     shardIds: previous.shardIds, scopePath: previous.scopePath,
     sourceFingerprint: previous.sourceFingerprint, backupBundleSha256: previous.backupBundleSha256,
     rootLock, sourceSheets: previous.sourceSheets, teamPluginsDigest: previous.teamPluginsDigest,
+    sourceTeamPluginsRowCount: snapshot.backupSnapshot.sheets.find(sheet => sheet.id === previous.rootId).teamPluginsRows.length,
     report: previous.report, remoteWrites: 0 });
 }
 
@@ -45,6 +46,8 @@ async function validateLockedPlan(plan) {
     || !Array.isArray(plan.shardIds) || plan.shardIds.length !== 8
     || new Set([plan.rootId, ...plan.shardIds]).size !== 9
     || !Array.isArray(plan.sourceSheets) || plan.sourceSheets.length !== 9
+    || (plan.sourceTeamPluginsRowCount !== undefined && (!Number.isInteger(plan.sourceTeamPluginsRowCount)
+      || plan.sourceTeamPluginsRowCount < 1 || plan.sourceTeamPluginsRowCount > 5001))
     || new Set(plan.sourceSheets.map(sheet => sheet.id)).size !== 9) fail('Повреждён план остановки старых записей.');
   const lock = validateSlotLock(plan.rootLock);
   if (lock.kind !== 'root' || lock.rootId !== plan.rootId || lock.spreadsheetId !== plan.rootId
